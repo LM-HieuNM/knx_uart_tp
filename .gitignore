@@ -1,0 +1,62 @@
+# STM32CubeIDE generated files
+Debug/
+Release/
+.build/
+.buildlog
+.project
+.cproject
+.settings/
+.metadata/
+*.launch
+*.cproject
+*.project
+*.settings
+*.launch
+
+# Build artifacts
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.d
+*.su
+*.cyclo
+*.mk
+objects.list
+objects.mk
+sources.mk
+subdir.mk
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.backup
+
+# STM32 specific
+*.ioc.bak
+*.ioc.old
+
+# User specific files (uncomment if needed)
+# .mxproject
+# .cproject
+# .project

@@ -1,0 +1,17 @@
+../Core/Src/main.c:87:6:encode_bit	3
+../Core/Src/main.c:99:6:encode_byte	3
+../Core/Src/main.c:119:6:prepare_frame	2
+../Core/Src/main.c:127:6:send_knx_frame	1
+../Core/Src/main.c:134:6:start_knx_decode	1
+../Core/Src/main.c:153:6:check_frame_timeout	5
+../Core/Src/main.c:202:5:main	2
+../Core/Src/main.c:263:6:SystemClock_Config	3
+../Core/Src/main.c:303:13:MX_IWDG_Init	2
+../Core/Src/main.c:331:13:MX_TIM1_Init	9
+../Core/Src/main.c:419:13:MX_USART2_UART_Init	2
+../Core/Src/main.c:450:13:MX_DMA_Init	1
+../Core/Src/main.c:468:13:MX_GPIO_Init	1
+../Core/Src/main.c:484:6:HAL_TIM_PeriodElapsedCallback	12
+../Core/Src/main.c:536:6:HAL_TIM_IC_CaptureCallback	13
+../Core/Src/main.c:604:6:HAL_TIM_PWM_PulseFinishedCallback	3
+../Core/Src/main.c:617:6:Error_Handler	1
