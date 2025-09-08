@@ -54,7 +54,7 @@ typedef enum {
 IWDG_HandleTypeDef hiwdg;
 
 TIM_HandleTypeDef htim1;
-DMA_HandleTypeDef hdma_tim1_ch2;
+TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart2;
 
@@ -77,7 +77,8 @@ volatile knx_state_t knx_state = KNX_IDLE;  // trạng thái KNX hiện tại
 volatile uint8_t  data_bits = 0;        // số bit dữ liệu đã nhận
 volatile uint8_t  parity_bit = 0;       // bit parity
 volatile uint8_t  parity_count = 0;     // đếm số bit 1 trong data
-
+volatile uint32_t rx_last_edge = 0;
+volatile uint8_t rx_half_seen = 0;
 /**
  *  ARR = 104 (chu kỳ 104 µs).
  *  CCR = 0 → PWM duty = 0% → Low suốt 104 µs (bit 1).
@@ -146,34 +147,57 @@ void start_knx_decode(void)
     data_bits = 0;
     parity_bit = 0;
     parity_count = 0;
+    rx_half_seen = 0;  // Reset half_seen flag
     
     HAL_TIM_IC_Start_IT(&htim1, TIM_CHANNEL_3);
 }
 
-void check_frame_timeout(void)
+static void knx_handle_bit(uint8_t bit)
 {
-    uint32_t now = HAL_GetTick();
-    
-    if (waiting_for_bit && (now - last_bit_time) > 200) {
-        knx_state = KNX_IDLE;  // idle
-        data_bits = 0;
-        parity_count = 0;
-        rx_byte = 0;
-        half_seen = 0;
-        waiting_for_bit = 0;
-        frame_timeout = 1;
-    }
-    
-    // Nếu đang nhận frame và quá 500ms không có bit nào
-    if (knx_state != KNX_IDLE && (now - last_bit_time) > 500) {
-        knx_state = KNX_IDLE;
-        data_bits = 0;
-        parity_count = 0;
-        rx_byte = 0;
-        half_seen = 0;
-        waiting_for_bit = 0;
-        frame_timeout = 1;
-    }
+	switch (knx_state) {
+		case KNX_IDLE:
+			if (bit == 0) {
+				knx_state = KNX_START;
+			}
+			break;
+		case KNX_START:
+			if (bit == 0) {
+				knx_state = KNX_DATA;
+				rx_byte = 0;
+				data_bits = 0;
+				parity_count = 0;
+			} else {
+				knx_state = KNX_IDLE; // error
+			}
+			break;
+		case KNX_DATA:
+			rx_byte = (rx_byte << 1) | bit;
+			if (bit) parity_count++;
+				data_bits++;
+			if (data_bits == 8) {
+				knx_state = KNX_PARITY;
+			}
+			break;
+		case KNX_PARITY:
+			parity_bit = bit;
+			knx_state = KNX_STOP;
+			break;
+		case KNX_STOP:
+			if (bit == 1) {
+				if (((parity_count % 2) == parity_bit) && (rx_index < 31)) {  // Giảm từ 32 xuống 31 để tránh overflow
+					rx_frame[rx_index++] = rx_byte;
+					frame_ready = 1;
+				} else {
+					// Parity error hoặc buffer full - reset
+					rx_index = 0;
+				}
+			}
+			knx_state = KNX_IDLE;
+			rx_byte = 0;
+			data_bits = 0;
+			parity_count = 0;
+			break;
+	}
 }
 
 
@@ -182,10 +206,10 @@ void check_frame_timeout(void)
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_DMA_Init(void);
 static void MX_IWDG_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -224,10 +248,10 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();
   MX_IWDG_Init();
   MX_TIM1_Init();
   MX_USART2_UART_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   HAL_IWDG_Refresh(&hiwdg);
   start_knx_decode();
@@ -239,16 +263,28 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint8_t data[] = {0x00, 0xFF, 0x55, 0xAA, 0x00, 0xFF, 0x55, 0xAA};
+  uint32_t millis = 0;
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    check_frame_timeout();
     
+    if(HAL_GetTick() - millis > 1000) {
+        millis = HAL_GetTick();
+        send_knx_frame(data, sizeof(data));
+    }
     if (frame_ready) {
         frame_ready = 0;
         HAL_UART_Transmit(&huart2, (uint8_t*)rx_frame, rx_index, 100);
+        rx_index = 0;  // Reset index sau khi gửi
+    }
+    
+    // Xử lý timeout frame
+    if (frame_timeout) {
+        frame_timeout = 0;
+        start_knx_decode(); // Reset decoder khi timeout
     }
 
     HAL_IWDG_Refresh(&hiwdg);
@@ -338,7 +374,6 @@ static void MX_TIM1_Init(void)
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
-  TIM_IC_InitTypeDef sConfigIC = {0};
   TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
   /* USER CODE BEGIN TIM1_Init 1 */
@@ -364,10 +399,6 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_TIM_IC_Init(&htim1) != HAL_OK)
-  {
-    Error_Handler();
-  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
@@ -376,20 +407,12 @@ static void MX_TIM1_Init(void)
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM2;
   sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_LOW;
   sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
   sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
   sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
   sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
-  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
-  if (HAL_TIM_IC_ConfigChannel(&htim1, &sConfigIC, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
   }
@@ -408,6 +431,51 @@ static void MX_TIM1_Init(void)
   __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 35;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 104;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -445,28 +513,13 @@ static void MX_USART2_UART_Init(void)
 }
 
 /**
-  * Enable DMA controller clock
-  */
-static void MX_DMA_Init(void)
-{
-
-  /* DMA controller clock enable */
-  __HAL_RCC_DMA1_CLK_ENABLE();
-
-  /* DMA interrupt init */
-  /* DMA1_Channel3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Channel3_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(DMA1_Channel3_IRQn);
-
-}
-
-/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
   */
 static void MX_GPIO_Init(void)
 {
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
 
   /* USER CODE END MX_GPIO_Init_1 */
@@ -474,132 +527,18 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
+  /*Configure GPIO pin : PA10 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-// Ngắt tràn timer - xử lý bit 1 (không có pulse)
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim->Instance == TIM1 && waiting_for_bit) {
-        // Timer tràn sau 104µs => bit 1
-        last_bit_time = HAL_GetTick();
-        
-        switch (knx_state) {
-            case KNX_IDLE:
-                knx_state = KNX_IDLE;
-                break;
-                
-            case KNX_START:
-                knx_state = KNX_IDLE;
-                break;
-                
-            case KNX_DATA:
-                rx_byte = (rx_byte << 1) | 1;  
-                data_bits++;
-                parity_count++;  
-                
-                if (data_bits == 8) {
-                    knx_state = KNX_PARITY;  
-                }
-                break;
-                
-            case KNX_PARITY: 
-                parity_bit = 1;
-                knx_state = KNX_STOP; 
-                break;
-                
-            case KNX_STOP:
-                if ((parity_count % 2) == 0) {
-                    if (rx_index < 32) {
-                        rx_frame[rx_index++] = rx_byte;
-                    }
-                    
-                    if (rx_index >= 32) {
-                        frame_ready = 1;
-                        rx_index = 0;
-                    }
-                }
-                knx_state = KNX_IDLE;
-                data_bits = 0;
-                parity_count = 0;
-                rx_byte = 0;
-                break;
-        }
-        
-        waiting_for_bit = 0;  // reset flag
-    }
-}
-
-// Ngắt Input Capture - xử lý bit 0 (có pulse)
-void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim) {
-	if (htim->Instance == TIM1 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_3) {
-		uint32_t capture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_3);
-		uint32_t delta = capture - last_capture;
-		last_capture = capture;
-
-        if (!half_seen) {
-            // Thấy cạnh Rising (bắt đầu bit 0)
-            half_seen = 1;
-            waiting_for_bit = 1;  
-            last_bit_time = HAL_GetTick();  
-        } else {
-            // Thấy cạnh Falling
-            if (delta > (T0_HIGH - T0_TOL) && delta < (T0_HIGH + T0_TOL)) {
-                // Đây là pulse High ~35 µs => bit 0
-                last_bit_time = HAL_GetTick();
-                
-                switch (knx_state) {
-                    case KNX_IDLE: 
-                        knx_state = KNX_START;  
-                        break;
-                        
-                    case KNX_START: 
-                        knx_state = KNX_DATA;  
-                        data_bits = 0;
-                        parity_count = 0;
-                        rx_byte = 0;
-                        break;
-                        
-                    case KNX_DATA: 
-                        rx_byte = (rx_byte << 1);  
-                        data_bits++;
-                        
-                        if (data_bits == 8) {
-                            knx_state = KNX_PARITY;  
-                        }
-                        break;
-                        
-                    case KNX_PARITY: 
-                        parity_bit = 0;
-                        knx_state = KNX_STOP;  
-                        break;
-                        
-                    case KNX_STOP: 
-                        knx_state = KNX_IDLE;
-                        break;
-                }
-            } else {
-                // Pulse không hợp lệ - có thể là noise
-                half_seen = 0;
-                waiting_for_bit = 0;
-                return;
-            }
-            half_seen = 0;
-            waiting_for_bit = 0;  // đã nhận xong bit
-        }
-
-		if ((TIM1->CCER & TIM_CCER_CC3P) == 0) {
-			// đang rising -> chuyển sang falling
-			TIM1->CCER |= TIM_CCER_CC3P;
-		} else {
-			// đang falling -> chuyển sang rising
-			TIM1->CCER &= ~TIM_CCER_CC3P;
-		}
-    }
-}
-
 // Callback khi DMA encode hoàn thành
 void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 {
@@ -608,6 +547,37 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
         
     }
 }
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_10) {
+        if (!rx_half_seen) {
+            rx_half_seen = 1;
+            __HAL_TIM_SET_COUNTER(&htim2, 0);
+            __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
+            HAL_TIM_Base_Start_IT(&htim2); // start timeout
+        } else {
+            // có cạnh thứ 2 ~35us => bit 0
+            knx_handle_bit(0);
+            rx_half_seen = 0;
+            HAL_TIM_Base_Stop_IT(&htim2);
+        }
+    }
+}
+
+
+void TIM2_IRQHandler(void)
+{
+	if(__HAL_TIM_GET_FLAG(&htim2, TIM_FLAG_UPDATE) != RESET) {
+		if(__HAL_TIM_GET_IT_SOURCE(&htim2, TIM_IT_UPDATE) != RESET) {
+			__HAL_TIM_CLEAR_IT(&htim2, TIM_IT_UPDATE);
+			knx_handle_bit(1);
+			rx_half_seen = 0;
+			HAL_TIM_Base_Stop_IT(&htim2);
+		}
+	}
+}
+
 /* USER CODE END 4 */
 
 /**
